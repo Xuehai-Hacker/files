@@ -1,0 +1,376 @@
+## 一、登录与认证模块
+
+### 1. 用户登录
+- **URL**: `/api/v2/platform/login` (POST)
+- **请求体** (JSON):
+  ```json
+  {
+    "userName": "手机号/账号",
+    "password": "MD5(明文密码).toUpperCase()",
+    "loginType": 5,  // 见 LoginType
+    "deviceId": "设备ID",
+    "osDisplay": "Android 12",
+    "imei": "...",
+    "ap": "WIFI",
+    "mac": "AA:BB:...",
+    "isNew": true,
+    "activationCode": "加密激活码",
+    "installTime": 1672531200000,
+    "mdmVersionCode": 4,
+    "mdmVersionName": "1.2.3",
+    "forceActivateBenefit": false,
+    "state": "第三方状态码",
+    "smsCode": null,  // 短信登录时填
+    "code": null,     // 微信扫码登录时填
+    "operatorId": null,
+    "boundTenantAppCode": null,
+    "boundTenantCode": null
+  }
+  ```
+- **请求头额外字段**: `UserId`, `SchoolId`, `Tenant`, `TenantCode`（来自 LoginRequest）
+- **响应**: `LResponse`，成功时 `responseBody` 为 `Account` JSON（包含 `openId`, `userId`, `schoolId`, `activated`, `studentGraduated`, `offlineEnabled`, `agreementSigned`, `accountTransition`, `forcePwdChangeSwitch`, `accountExpireRemindContent`, `upgradeUsernameMessage`, `uv`, `randomStr`, `accessToken`, `refreshToken`, `expiresIn`, `refreshExpiresIn`, `timestampDTO` 等）。
+- **处理**:
+  - `AccountRepository.dealLoginResult` → `unifiedDealLoginResult`：
+    - 判断 `account.isContinueToBind()` 若为 true 则抛出 `WeChatLoginException`（微信未绑定）。
+    - 解析 `forcePwdChangeSwitch` 存入本地。
+    - 保存账号名、密码、Account 对象。
+    - 调用 `LoginUtil.afterLogin`（更新 SessionData）。
+    - 保存签收忽略次数、协议状态等。
+    - 解析 `joinedClass` 和 `tenantCodes` 存储。
+
+### 2. 设备激活
+- **URL**: `/api/v1/pub/platform/activation/verify` (POST)
+- **请求体**: `{"code": "激活码", "deviceId": "设备ID"}`
+- **响应**: `LResponse`（成功 code 2xx）
+- **处理**: 返回 `Observable<Boolean>`，成功则继续登录。
+
+### 3. 激活码状态查询
+- **URL**: `/api/v1/pub/platform/activation/status` (POST)
+- **请求体**: `{"code": "激活码", "deviceId": "设备ID"}`
+- **响应**: `LResponse`，`responseBody` JSON: `{"activated": true/false}`
+- **处理**: 返回 `Observable<Boolean>`。
+
+### 4. 获取账号锁定设备
+- **URL**: `/api/v1/pub/users/{userId}/deviceLocks` (GET)
+- **响应**: `LResponse`，`responseBody` JSON: `{"deviceId": "..."}`
+- **处理**: 返回 `Observable<String>` 设备ID。
+
+### 5. 锁定账号
+- **URL**: `/api/v1/pub/users/{userId}/deviceLocks` (POST)
+- **请求体**: `{"deviceId": "设备ID", "operator": "用户ID"}`
+- **响应**: `LResponse`
+- **处理**: 返回 `Observable<Boolean>`。
+
+### 6. 解锁账号
+- **URL**: `/api/v1/pub/users/{userId}/deviceLocks` (DELETE)
+- **请求体**: `{"deviceId": "设备ID"}`
+- **处理**: 同锁定。
+
+### 7. 刷新 Token
+- **URL**: `/api/v1/platform/users/{userId}/refresh` (POST)
+- **请求体**: `{"refreshToken": "...", "deviceId": "...", "osDisplay": "...", "imei": "...", "mac": "..."}`
+- **响应**: `LResponse`，`responseBody` 为新 `Account`。
+- **处理**:
+  - 更新本地 `Account`，写入 UV 密钥文件。
+  - 若毕业则抛异常。
+
+---
+
+## 二、登录后数据同步（CheckDataEntity）
+
+### 8. 登录后检查
+- **URL**: `/api/v2/pub/platform/users/{userId}/check` (GET)
+- **参数**: `userId`, `userType`, `schoolId`, `deviceType`, `deviceId`, `configVersion`, `appVersion`, `sdkNeedStatus`, `sdkTypes`
+- **响应**: `LResponse`，`responseBody` 为 `CheckDataEntity` JSON，包含：
+  - `config`: JSONObject（应用配置）
+  - `apps`: JSONObject（应用列表及用户主题）
+  - `appModules`: JSONObject（模块权限）
+  - `eyeShield`: JSONObject（护眼数据）
+  - `countDowns`: JSON 数组（倒计时列表）
+  - `sdkLicenses`: JSON 数组（设备许可）
+  - `assist`: AssistNotify（辅助功能）
+  - `survey`: AdvertEntity（问卷）
+- **处理**:
+  - 解析 `config` → `AppModel.parseAppConfig()`
+  - 解析 `apps` → 应用列表及 `userUsingTheme` → `ThemeModel.parseUserUsingTheme()`
+  - 解析 `appModules` → 模块权限
+  - 解析 `eyeShield` → 护眼配置
+  - 解析 `countDowns` → 保存到 `CountDownConfig`
+  - 解析 `sdkLicenses` → 激活支付 License（若存在且设备支持）
+
+---
+
+## 三、签收模块
+
+### 9. 获取签收状态
+- **URL**: 未直接给出，推断为 `/api/v1/signature/status` (GET) (来自 `SignatureRemoteDataSource.reqSignatureState`)
+- **响应**: `LResponse`，`responseBody` JSON:
+  ```json
+  {
+    "deviceStatus": 1,   // 0未签收, 1已签收
+    "signInStatus": 1,
+    "protocolStatus": 0, // 0未签, 1已签
+    "partsStatus": 0
+  }
+  ```
+- **处理**: 解析为 `SignatureInfo`，判断是否需签收或签署协议。
+
+### 10. 忽略签收（明天再说）
+- **URL**: 推断为 `/api/v1/signature/ignore` (POST)（`SignatureRemoteDataSource.signedIgnored`）
+- **响应**: `LResponse`
+- **处理**: 成功后更新本地忽略时间戳和次数。
+
+### 11. 上传签收表单
+- **URL**: 推断为 `/api/v1/signature/form` (POST)（`SignatureRemoteDataSource.uploadSignatureForm`）
+- **请求体**: JSON 字符串
+- **处理**: 回调通知。
+
+---
+
+## 四、微信相关
+
+### 12. 获取微信应用签名
+- **URL**: `/api/v1/pub/platform/app/weChat/signature` (GET)
+- **响应**: `LResponse`，`responseBody` 为 `WxSignatureInfoEntity`（含 `appId`, `nonceStr`, `signature`, `timestamp`）
+- **处理**: 启动微信 OAuth 授权。
+
+### 13. 微信扫码登录
+- **URL**: 同登录接口 `/api/v2/platform/login`，`loginType=6`，`userName` 放 `authCode`。
+- **响应**: 若账号未绑定，返回 code=202，并抛出 `WeChatLoginException`（内含 `Account` 用于引导绑定）；否则返回正常 `Account`。
+- **处理**: 若 code=202，跳转绑定页；否则正常登录。
+
+### 14. 微信绑定登录
+- **URL**: `/api/v1/pub/platform/bindAndLogin` (POST)
+- **请求体**: 包含 `userName`, `loginType`, `password`(MD5), `deviceId`, `osDisplay`, `imei`, `ap`, `mac`, `isNew`, `activationCode`, `installTime`, `mdmVersionCode`, `mdmVersionName`, `bindAccount`, `bindType`, 以及 `smsCode` 或 `password`
+- **响应**: `LResponse`，返回 `Account`
+- **处理**: 同普通登录。
+
+### 15. 检查微信绑定状态
+- **URL**: `/api/v1/pub/platform/accounts/binding` (POST)
+- **请求体**: `{"sceneId": "...", "userId": ...}`
+- **响应**: `LResponse`，code 200 表示已绑定，其他未绑定。
+- **处理**: 返回 `Observable<Boolean>`。
+
+---
+
+## 五、用户信息与设置
+
+### 16. 重新加载用户信息
+- **URL**: `/api/v1/pub/platform/users/{userId}/profile` (GET)
+- **响应**: `LResponse`，`responseBody` 为 `Account`
+- **处理**: 解析并更新。
+
+### 17. 获取用户详情（含隐私信息）
+- **URL**: `/api/v1/users/{userId}` (GET)
+- **响应**: `LResponse`，`responseBody` 为 JSON 数组（单个用户对象），包含 `id`, `fatherPhone`, `motherPhone`, `mobile`, `sex`, `securityQuestions`, `address` 等。
+- **处理**: 存入本地数据库。
+
+### 18. 获取协议 URL
+- **URL**: `/api/v1/pub/platform/agreement` (GET)
+- **参数**: `type` (1或2), `version` (1或2)
+- **响应**: `LResponse`，`responseBody` 为 `UserAgreementUrls`（含 `userAgreementUrl`, `userPrivacyAgreementUrl`, `childPrivacyAgreementUrl`, `jointAgreementUrl`, `userBizRequestUrl`）
+- **处理**: 缓存，若失败则使用默认 URL。
+
+### 19. 获取租户列表
+- **URL**: `/api/v1/pri/tenants/users/{userId}/binding` (GET)
+- **响应**: `LResponse`，`responseBody` JSON: `{"userDTOs": [{"tenantCode": "..."}, ...]}`
+- **处理**: 提取 tenantCode 列表保存。
+
+### 20. 获取头像列表
+- **URL**: `/api/v1/users/avatars` (GET)
+- **参数**: `roles=student` 或 `teacher`
+- **响应**: `LResponse`，`responseBody` 为 `AvatarEntity` 列表
+- **处理**: 返回 `Observable<ZOptional<List<AvatarEntity>>>`。
+
+### 21. 获取毕业信息
+- **URL**: `/api/v1/pub/platform/check/disable` (GET)
+- **参数**: `userId`, `deviceId`
+- **响应**: `LResponse`，`responseBody` 为 `StudentGraduatedToken`
+- **处理**: 解析 token。
+
+### 22. 获取应用版本列表
+- **URL**: `/api/v1/pub/users/{userId}/product/versions` (GET)
+- **参数**: `needFamilyManager=true/false`
+- **响应**: `LResponse`，`responseBody` JSON: `{"pvs": [{"versionCode":"...", "name":"...", "activationStatus":0}], "managerResponse": {"managerId":..., "managerName":"..."}}`
+- **处理**: 解析 `AppEdition` 列表和 `UserInfo`（管理者），存入本地。
+
+### 23. 激活应用版本
+- **URL**: `/api/v1/pub/users/{userId}/product/versions/select` (POST)
+- **请求体**: `{"versionCode": "版本ID"}`
+- **响应**: `LResponse`
+- **处理**: 返回 `Flow<Boolean>`。
+
+### 24. 修改密码（已登录）
+- **URL**: `/api/v1/users/{userId}/password` (PATCH)
+- **请求体**: `{"logonPassword": "加密旧密码", "newLogonPassword": "加密新密码", "associatedTenantCodes": [...] }`
+- **请求头**: Authorization Bearer token
+- **响应**: `LResponse`
+- **处理**: 回调通知结果。
+
+### 25. 设置新密码（忘记密码）
+- **URL**: `/api/v1/users/password` (PUT)
+- **参数**: `logonName`, `mobile`
+- **请求体**: `{"newPassword": "加密", "token": "...", "type": 0}`
+- **响应**: `LResponse`
+- **处理**: 回调。
+
+### 26. 重置账号（绑定账号）
+- **URL**: `/api/v1/pub/users/accounts/native/bind` (PATCH)
+- **请求体**: `{"userId":..., "account":..., "credential":..., "nativeAccountType":...}`
+- **响应**: `LResponse`
+
+### 27. 重置密码（通过安全问题）
+- **URL**: `/api/v2/pub/users/password` (PUT)
+- **请求体**: `{"logonName":"...", "mobile":"...", "newPassword":"加密", "tenantCode":"...", "token":"...", "type":...}`
+- **响应**: `LResponse`（Flow）
+
+### 28. 签署协议
+- **URL**: `/api/v1/pub/platform/agreement/sign` (POST)
+- **请求体**: `{"version":2, "userId":..., "signatureContent":"签名图片URL"}`
+- **响应**: `LResponse`（Flow）
+
+### 29. 验证安全问题
+- **URL**: `/api/v1/users/questions/verify` (POST)（实际使用 POST，但构造时带参数）
+- **参数**: `logonName`, `mac`, `isLimit`
+- **请求体**: JSON 数组（答案列表）
+- **响应**: `LResponse`
+- **处理**: 回调。
+
+### 30. 补全资料
+- **URL**: `/api/v1/users/{userId}/completed` (PATCH)
+- **请求体**: `{"mobile": "...", "securityQuestions": [...], "verifyCode": "..."}`
+- **响应**: `LResponse`
+- **处理**: 回调。
+
+### 31. 获取补全资料验证码
+- **URL**: `/api/v1/users/{userId}/completed/code` (GET)
+- **参数**: `mobile`
+- **响应**: `LResponse`
+- **处理**: 回调。
+
+---
+
+## 六、手机验证码与绑定
+
+### 32. 发送手机验证码
+- **URL**: `/api/v1/pub/users/messages/mobile/code` (GET)
+- **参数**: `mobile`, `tenantCode`, `usage`, `captchaCode`(optional), `explosionProof`, `appCode`, `templateCode`
+- **响应**: `LResponse`
+- **处理**: 返回 `Observable<LResponse>`。
+
+### 33. 验证手机验证码
+- **URL**: `/api/v1/pub/users/messages/mobile/code/verify` (POST)
+- **请求体**: `{"codeUsage":..., "mobile":..., "smsCode":..., "tenantCode":...}`
+- **响应**: `LResponse`（Flow）
+
+### 34. 获取手机绑定验证码（用于解绑）
+- **URL**: `/api/v1/users/password/verify` (POST)（实际获取验证码？命名不明确）
+- **请求体**: `{"password": "MD5(密码)", "userId": ...}`
+- **响应**: `LResponse`，`responseBody` 包含 `code`（验证码）
+- **处理**: 返回 `Observable<String>`。
+
+### 35. 解绑账号信息
+- **URL**: `/api/v1/pub/platform/accounts/unbind` (POST)
+- **请求体**: `{"bindType": 1, "userId":..., "password": "MD5(密码)"}`
+- **响应**: `LResponse`
+- **处理**: 返回 `Observable<Boolean>`。
+
+### 36. 绑定账号信息（微信绑定）
+- **URL**: `/api/v1/pub/platform/accounts/binding` (POST) （与检查绑定相同路径，但参数不同）
+- **请求体**: `AccountBindRequest`（含账号、密码、绑定类型等）
+- **响应**: `LResponse`，返回 `Account`
+- **处理**: 若绑定类型为1（微信），则更新本地 Account 的微信信息。
+
+### 37. 更换绑定手机
+- **URL**: `/api/v1/pri/users/accounts/mobile` (PATCH)
+- **请求体**: `{"account":..., "authCode":..., "smsCode":..., "userId":...}`
+- **处理**: 回调。
+
+### 38. 验证账号与手机绑定关系
+- **URL**: `/api/v1/users/{account}/{mobile}/verify` (GET)
+- **处理**: 回调。
+
+---
+
+## 七、资源与课程
+
+### 39. 获取全国课程列表
+- **URL**: `/api/v1/pub/platform/courses/user/{userId}` (GET)
+- **响应**: `LResponse`，`responseBody` 为 `NationSchoolTodoItem` 列表
+- **处理**: 返回 Flow。
+
+### 40. 获取全国待办
+- **URL**: `/api/v1/pub/platform/todoList/user/{userId}` (GET)
+- **处理**: 同上。
+
+### 41. 获取用户资源书本
+- **URL**: `/api/v1/pub/platform/collapse/resources/users/{userId}` (GET)
+- **参数**: `gradeId`
+- **响应**: `LResponse`，`responseBody` 为 `UserResourceBook` 列表
+- **处理**: 按科目分组。
+
+### 42. 获取用户资源年级
+- **URL**: `/api/v1/pub/platform/collapse/resources/grades/users/{userId}` (GET)
+- **响应**: `LResponse`，`responseBody` 为 `UserResourceGrade` 列表
+- **处理**: 保存。
+
+---
+
+## 八、其他
+
+### 43. 上报使用信息
+- **URL**: `/api/v1/pub/control/duration/useds` (POST)
+- **请求体**: JSON 字符串
+- **响应**: `LResponse`
+- **处理**: 返回 `LResponse`。
+
+### 44. 获取注册 URL
+- **URL**: `/api/v1/pub/platform/routing-urls/register` (GET)
+- **参数**: `deviceId`, `imei`
+- **响应**: `LResponse`，`responseBody` JSON: `{"url": "..."}`
+- **处理**: 返回 Flow<String>。
+
+### 45. 请求用户二维码
+- **URL**: `/api/v1/pub/platform/customer/{type}/qrcode` (GET)
+- **参数**: `userId`
+- **响应**: `LResponse`，`responseBody` JSON: `{"showResponseParentQrCode": true, "url": "..."}`
+- **处理**: 更新 MyQrCode Flow。
+
+### 46. 获取用户关联账号
+- **URL**: `/api/v1/pub/users/associations` (GET)
+- **参数**: `logonName`, `tenantCode`
+- **响应**: `LResponse`，`responseBody` JSON 数组，每个包含 `relationTitle` 和加密的 `mobile`
+- **处理**: 解密手机号，返回 List<UserAssociation>。
+
+### 47. 请求验证安全问题（找回密码）
+- **URL**: `/api/v1/users/questions` (GET)
+- **参数**: `logonName`, `mac`
+- **响应**: `LResponse`（包含问题列表）
+
+### 48. 获取手机验证码（找回密码）
+- **URL**: `/api/v1/users/password/code` (GET)
+- **参数**: `logonName`, `mobile`
+- **响应**: `LResponse`
+
+---
+
+## 九、响应封装与加密
+
+- **加密**:
+  - 密码传输：`EncryptionUtil.getMD5(password).toUpperCase()`
+  - 激活码加密：`EncryptUtils.encrypt(activationCode)` (XOR + Base64)
+  - 密码加密存储：`PasswordEncryptor.encrypt()` (XOR + 时间戳)
+- **响应**：所有请求统一返回 `LResponse`，包含 `code`、`responseBody`、`restfulError`，判断成功 `code>=200 && code<300`。
+
+---
+
+## 十、构建模拟服务器的关键注意事项
+
+1. **所有 POST 请求的 Content-Type 为 `application/json`**。
+2. **登录接口**需根据 `loginType` 返回不同的 `Account` 状态，如 `activated=false` 触发激活流程，`studentGraduated=true` 跳转毕业页等。
+3. **微信登录**需返回 code=202 并附带 `Account`（未绑定）以跳转绑定页。
+4. **`/check` 接口**需返回完整的 `CheckDataEntity` JSON，包含 `config`、`apps` 等。
+5. **签收状态**接口返回的 `deviceStatus` 和 `signInStatus` 影响登录后是否强制签收。
+6. **Token 刷新**接口返回新的 `accessToken` 和 `refreshToken`，过期时间需合理。
+
+以上即所有已知 API 的完整清单。可根据这些信息构建模拟服务器，返回符合客户端预期的数据结构和状态码。
